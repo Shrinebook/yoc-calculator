@@ -11,18 +11,51 @@ st.caption("楽天証券の保有銘柄CSVから取得価格ベースの利回�
 
 
 # ---------- ヘルパー関数 ----------
-def load_csv(file_bytes):
-    """エンコーディングを自動判定してCSV読み込み"""
-    for enc in ['cp932', 'utf-8-sig', 'utf-8']:
+def load_rakuten_csv(file_bytes):
+    """楽天証券の保有商品CSVを読み込む。
+    冒頭の評価額サマリーや「■NISA成長投資枠」などの
+    セクションヘッダーをスキップし、銘柄データ部分だけ抽出する。
+    """
+    # エンコーディング自動判定（楽天はUTF-8出力）
+    text = None
+    for enc in ['utf-8-sig', 'utf-8', 'cp932']:
         try:
-            return pd.read_csv(io.BytesIO(file_bytes), encoding=enc)
-        except (UnicodeDecodeError, pd.errors.ParserError):
+            text = file_bytes.decode(enc)
+            break
+        except UnicodeDecodeError:
             continue
-    return None
+    if text is None:
+        return None
+
+    lines = text.splitlines()
+
+    # 「銘柄コード」で始まる行をデータヘッダーとして検出
+    header_idx = None
+    for i, line in enumerate(lines):
+        if line.lstrip().startswith('銘柄コード'):
+            header_idx = i
+            break
+
+    if header_idx is None:
+        # フォールバック: そのまま読み込み
+        try:
+            return pd.read_csv(io.StringIO(text))
+        except Exception:
+            return None
+
+    data_text = '\n'.join(lines[header_idx:])
+    try:
+        df = pd.read_csv(io.StringIO(data_text))
+    except Exception:
+        return None
+
+    # 末尾の口座合計行などを除外（銘柄コード列が4桁数字の行だけ残す）
+    code_col = df.columns[0]
+    mask = df[code_col].astype(str).str.match(r'^\d{4}$', na=False)
+    return df[mask].reset_index(drop=True)
 
 
 def extract_code(cell):
-    """文字列から4桁の銘柄コードを抽出"""
     if pd.isna(cell):
         return None
     m = re.search(r'(\d{4})', str(cell))
@@ -30,7 +63,6 @@ def extract_code(cell):
 
 
 def to_number(cell):
-    """カンマや通貨記号を除去して数値化"""
     if pd.isna(cell):
         return None
     s = re.sub(r'[^\d.\-]', '', str(cell))
@@ -47,7 +79,6 @@ def fetch_stock_data(ticker):
         stock = yf.Ticker(ticker)
         info = stock.info
 
-        # 年間配当の優先順位: 予想 → 実績 → 過去12ヶ月合計
         div = 0.0
         for key in ['dividendRate', 'trailingAnnualDividendRate']:
             v = info.get(key)
@@ -60,7 +91,6 @@ def fetch_stock_data(ticker):
                 cutoff = pd.Timestamp.now(tz=divs.index.tz) - pd.Timedelta(days=365)
                 div = float(divs[divs.index >= cutoff].sum())
 
-        # 現在値
         hist = stock.history(period="5d")
         price = float(hist['Close'].iloc[-1]) if len(hist) > 0 else None
 
@@ -78,10 +108,12 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is not None:
-    df = load_csv(uploaded.read())
-    if df is None:
-        st.error("CSVの読み込みに失敗しました")
+    df = load_rakuten_csv(uploaded.read())
+    if df is None or len(df) == 0:
+        st.error("CSVの読み込みに失敗しました。楽天証券の保有商品CSVをアップロードしてください。")
         st.stop()
+
+    st.success(f"{len(df)}銘柄を読み込みました")
 
     with st.expander("CSV プレビュー"):
         st.dataframe(df.head())
@@ -95,9 +127,9 @@ if uploaded is not None:
                 return i
         return default
 
-    col_code = st.selectbox("銘柄コード列", cols, index=guess(['コード', '銘柄']))
-    col_qty = st.selectbox("保有数量列", cols, index=guess(['数量', '株数']))
-    col_avg = st.selectbox("平均取得単価列", cols, index=guess(['平均取得', '取得価', '取得単価']))
+    col_code = st.selectbox("銘柄コード列", cols, index=guess(['銘柄コード']))
+    col_qty = st.selectbox("保有数量列", cols, index=guess(['保有数量', '数量']))
+    col_avg = st.selectbox("平均取得単価列", cols, index=guess(['平均取得価額', '平均取得', '取得単価']))
 
     if st.button('実質配当利回りを計算', type='primary'):
         rows = []
@@ -113,7 +145,7 @@ if uploaded is not None:
             status.text(f"取得中: {code} ({i + 1}/{n})")
             progress.progress((i + 1) / n)
 
-            if not code or not qty or not avg:
+            if not code or not qty or qty <= 0 or not avg or avg <= 0:
                 continue
 
             ticker = f"{code}.T"
@@ -127,7 +159,7 @@ if uploaded is not None:
             rows.append({
                 'コード': code,
                 '銘柄': name or str(row[col_code]),
-                '数量': int(qty),
+                '数量': qty,
                 '取得単価': avg,
                 '現在値': price,
                 '1株配当': div_per_share,
@@ -143,7 +175,6 @@ if uploaded is not None:
             st.warning("有効なデータがありませんでした")
             st.stop()
 
-        # サマリ
         total_cost = sum(r['取得単価'] * r['数量'] for r in rows)
         total_div = sum(r['年間配当'] for r in rows)
         port_yoc = (total_div / total_cost * 100) if total_cost > 0 else 0
@@ -153,15 +184,15 @@ if uploaded is not None:
         c2.metric("年間予想配当", f"¥{total_div:,.0f}")
         c3.metric("PF実質利回り", f"{port_yoc:.2f}%")
 
-        # ソート可能テーブル
         result = pd.DataFrame(rows).sort_values('実質利回り%', ascending=False).reset_index(drop=True)
 
         st.dataframe(
             result.style.format({
-                '取得単価': '{:,.1f}',
-                '現在値': '{:,.1f}',
+                '数量': '{:,.4f}',
+                '取得単価': '{:,.2f}',
+                '現在値': '{:,.2f}',
                 '1株配当': '{:,.2f}',
-                '年間配当': '{:,.0f}',
+                '年間配当': '{:,.2f}',
                 '現在利回り%': '{:.2f}',
                 '実質利回り%': '{:.2f}',
                 'YoC-現在利回り': '{:+.2f}',
@@ -170,7 +201,6 @@ if uploaded is not None:
             height=600,
         )
 
-        # CSV ダウンロード
         st.download_button(
             "結果をCSVでダウンロード",
             result.to_csv(index=False).encode('utf-8-sig'),
