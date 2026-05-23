@@ -54,10 +54,14 @@ def load_rakuten_csv(file_bytes):
     if len(df) == 0:
         return None, "データ行が0件です", None
 
-    # 4) 銘柄コード列が4桁数字の行だけ残す（末尾の合計行などを除外）
+    # 4) 銘柄コード列から4桁の数字を抽出できる行だけ残す
+    #    （末尾の合計行を除外。pandasがコードをfloat化する問題にも対応）
     code_col = df.columns[0]
-    mask = df[code_col].astype(str).str.strip().str.match(r'^\d{4}$', na=False)
-    df = df[mask].reset_index(drop=True)
+    extracted = df[code_col].astype(str).str.extract(r'(\d{4})', expand=False)
+    mask = extracted.notna()
+    df = df[mask].copy()
+    df[code_col] = extracted[mask].values  # 4桁コードに正規化
+    df = df.reset_index(drop=True)
 
     if len(df) == 0:
         return None, "4桁の銘柄コードを持つ行がありません", None
